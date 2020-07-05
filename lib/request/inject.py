@@ -1,9 +1,11 @@
 #!/usr/bin/env python
 
 """
-Copyright (c) 2006-2017 sqlmap developers (http://sqlmap.org/)
-See the file 'doc/COPYING' for copying permission
+Copyright (c) 2006-2020 sqlmap developers (http://sqlmap.org/)
+See the file 'LICENSE' for copying permission
 """
+
+from __future__ import print_function
 
 import re
 import time
@@ -15,11 +17,14 @@ from lib.core.common import calculateDeltaSeconds
 from lib.core.common import cleanQuery
 from lib.core.common import expandAsteriskForColumns
 from lib.core.common import extractExpectedValue
+from lib.core.common import filterNone
 from lib.core.common import getPublicTypeMembers
+from lib.core.common import getTechnique
 from lib.core.common import getTechniqueData
 from lib.core.common import hashDBRetrieve
 from lib.core.common import hashDBWrite
 from lib.core.common import initTechnique
+from lib.core.common import isDigit
 from lib.core.common import isNoneValue
 from lib.core.common import isNumPosStrValue
 from lib.core.common import isTechniqueAvailable
@@ -28,11 +33,15 @@ from lib.core.common import popValue
 from lib.core.common import pushValue
 from lib.core.common import randomStr
 from lib.core.common import readInput
+from lib.core.common import setTechnique
 from lib.core.common import singleTimeWarnMessage
+from lib.core.compat import xrange
 from lib.core.data import conf
 from lib.core.data import kb
 from lib.core.data import logger
 from lib.core.data import queries
+from lib.core.decorators import lockedmethod
+from lib.core.decorators import stackedmethod
 from lib.core.dicts import FROM_DUMMY_TABLE
 from lib.core.enums import CHARSET_TYPE
 from lib.core.enums import DBMS
@@ -42,8 +51,11 @@ from lib.core.exception import SqlmapConnectionException
 from lib.core.exception import SqlmapDataException
 from lib.core.exception import SqlmapNotVulnerableException
 from lib.core.exception import SqlmapUserQuitException
+from lib.core.settings import GET_VALUE_UPPERCASE_KEYWORDS
+from lib.core.settings import INFERENCE_MARKER
 from lib.core.settings import MAX_TECHNIQUES_PER_VALUE
 from lib.core.settings import SQL_SCALAR_REGEX
+from lib.core.settings import UNICODE_ENCODING
 from lib.core.threads import getCurrentThreadData
 from lib.request.connect import Connect as Request
 from lib.request.direct import direct
@@ -53,6 +65,7 @@ from lib.techniques.dns.test import dnsTest
 from lib.techniques.dns.use import dnsUse
 from lib.techniques.error.use import errorUse
 from lib.techniques.union.use import unionUse
+from thirdparty import six
 
 def _goDns(payload, expression):
     value = None
@@ -73,21 +86,33 @@ def _goInference(payload, expression, charsetType=None, firstChar=None, lastChar
 
     value = _goDns(payload, expression)
 
+    if payload is None:
+        return None
+
     if value is not None:
         return value
 
-    timeBasedCompare = (kb.technique in (PAYLOAD.TECHNIQUE.TIME, PAYLOAD.TECHNIQUE.STACKED))
+    timeBasedCompare = (getTechnique() in (PAYLOAD.TECHNIQUE.TIME, PAYLOAD.TECHNIQUE.STACKED))
+
+    if timeBasedCompare and conf.threads > 1 and kb.forceThreads is None:
+        msg = "multi-threading is considered unsafe in "
+        msg += "time-based data retrieval. Are you sure "
+        msg += "of your choice (breaking warranty) [y/N] "
+
+        kb.forceThreads = readInput(msg, default='N', boolean=True)
 
     if not (timeBasedCompare and kb.dnsTest):
-        if (conf.eta or conf.threads > 1) and Backend.getIdentifiedDbms() and not re.search("(COUNT|LTRIM)\(", expression, re.I) and not (timeBasedCompare and not conf.forceThreads):
+        if (conf.eta or conf.threads > 1) and Backend.getIdentifiedDbms() and not re.search(r"(COUNT|LTRIM)\(", expression, re.I) and not (timeBasedCompare and not kb.forceThreads):
 
-            if field and re.search("\ASELECT\s+DISTINCT\((.+?)\)\s+FROM", expression, re.I):
-                expression = "SELECT %s FROM (%s)" % (field, expression)
+            if field and re.search(r"\ASELECT\s+DISTINCT\((.+?)\)\s+FROM", expression, re.I):
+                if Backend.getIdentifiedDbms() in (DBMS.MYSQL, DBMS.PGSQL, DBMS.MONETDB, DBMS.VERTICA, DBMS.CRATEDB, DBMS.CUBRID):
+                    alias = randomStr(lowercase=True, seed=hash(expression))
+                    expression = "SELECT %s FROM (%s)" % (field if '.' not in field else re.sub(r".+\.", "%s." % alias, field), expression)  # Note: MonetDB as a prime example
+                    expression += " AS %s" % alias
+                else:
+                    expression = "SELECT %s FROM (%s)" % (field, expression)
 
-                if Backend.getIdentifiedDbms() in (DBMS.MYSQL, DBMS.PGSQL):
-                    expression += " AS %s" % randomStr(lowercase=True, seed=hash(expression))
-
-            if field and conf.hexConvert or conf.binaryFields and field in conf.binaryFields.split(','):
+            if field and conf.hexConvert or conf.binaryFields and field in conf.binaryFields:
                 nulledCastedField = agent.nullAndCastField(field)
                 injExpression = expression.replace(field, nulledCastedField, 1)
             else:
@@ -141,9 +166,9 @@ def _goInferenceProxy(expression, fromUser=False, batch=False, unpack=True, char
     parameter through a bisection algorithm.
     """
 
-    initTechnique(kb.technique)
+    initTechnique(getTechnique())
 
-    query = agent.prefixQuery(kb.injection.data[kb.technique].vector)
+    query = agent.prefixQuery(getTechniqueData().vector)
     query = agent.suffixQuery(query)
     payload = agent.payload(newValue=query)
     count = None
@@ -156,7 +181,7 @@ def _goInferenceProxy(expression, fromUser=False, batch=False, unpack=True, char
 
     _, _, _, _, _, expressionFieldsList, expressionFields, _ = agent.getFields(expression)
 
-    rdbRegExp = re.search("RDB\$GET_CONTEXT\([^)]+\)", expression, re.I)
+    rdbRegExp = re.search(r"RDB\$GET_CONTEXT\([^)]+\)", expression, re.I)
     if rdbRegExp and Backend.isDbms(DBMS.FIREBIRD):
         expressionFieldsList = [expressionFields]
 
@@ -172,10 +197,7 @@ def _goInferenceProxy(expression, fromUser=False, batch=False, unpack=True, char
     # forge the SQL limiting the query output one entry at a time
     # NOTE: we assume that only queries that get data from a table
     # can return multiple entries
-    if fromUser and " FROM " in expression.upper() and ((Backend.getIdentifiedDbms() \
-      not in FROM_DUMMY_TABLE) or (Backend.getIdentifiedDbms() in FROM_DUMMY_TABLE and not \
-      expression.upper().endswith(FROM_DUMMY_TABLE[Backend.getIdentifiedDbms()]))) \
-      and not re.search(SQL_SCALAR_REGEX, expression, re.I):
+    if fromUser and " FROM " in expression.upper() and ((Backend.getIdentifiedDbms() not in FROM_DUMMY_TABLE) or (Backend.getIdentifiedDbms() in FROM_DUMMY_TABLE and not expression.upper().endswith(FROM_DUMMY_TABLE[Backend.getIdentifiedDbms()]))) and not re.search(SQL_SCALAR_REGEX, expression, re.I):
         expression, limitCond, topLimit, startLimit, stopLimit = agent.limitCondition(expression)
 
         if limitCond:
@@ -216,7 +238,7 @@ def _goInferenceProxy(expression, fromUser=False, batch=False, unpack=True, char
                             elif choice == 'Q':
                                 raise SqlmapUserQuitException
 
-                            elif choice.isdigit() and int(choice) > 0 and int(choice) <= count:
+                            elif isDigit(choice) and int(choice) > 0 and int(choice) <= count:
                                 stopLimit = int(choice)
 
                                 infoMsg = "sqlmap is now going to retrieve the "
@@ -227,7 +249,7 @@ def _goInferenceProxy(expression, fromUser=False, batch=False, unpack=True, char
                                 message = "how many? "
                                 stopLimit = readInput(message, default="10")
 
-                                if not stopLimit.isdigit():
+                                if not isDigit(stopLimit):
                                     errMsg = "invalid choice"
                                     logger.error(errMsg)
 
@@ -242,7 +264,7 @@ def _goInferenceProxy(expression, fromUser=False, batch=False, unpack=True, char
 
                                 return None
 
-                    elif count and not count.isdigit():
+                    elif count and not isDigit(count):
                         warnMsg = "it was not possible to count the number "
                         warnMsg += "of entries for the SQL query provided. "
                         warnMsg += "sqlmap will assume that it returns only "
@@ -273,7 +295,7 @@ def _goInferenceProxy(expression, fromUser=False, batch=False, unpack=True, char
                         raise SqlmapDataException(errMsg)
 
                 except KeyboardInterrupt:
-                    print
+                    print()
                     warnMsg = "user aborted during dumping phase"
                     logger.warn(warnMsg)
 
@@ -291,10 +313,10 @@ def _goBooleanProxy(expression):
     Retrieve the output of a boolean based SQL query
     """
 
-    initTechnique(kb.technique)
+    initTechnique(getTechnique())
 
     if conf.dnsDomain:
-        query = agent.prefixQuery(kb.injection.data[kb.technique].vector)
+        query = agent.prefixQuery(getTechniqueData().vector)
         query = agent.suffixQuery(query)
         payload = agent.payload(newValue=query)
         output = _goDns(payload, expression)
@@ -302,13 +324,13 @@ def _goBooleanProxy(expression):
         if output is not None:
             return output
 
-    vector = kb.injection.data[kb.technique].vector
-    vector = vector.replace("[INFERENCE]", expression)
+    vector = getTechniqueData().vector
+    vector = vector.replace(INFERENCE_MARKER, expression)
     query = agent.prefixQuery(vector)
     query = agent.suffixQuery(query)
     payload = agent.payload(newValue=query)
 
-    timeBasedCompare = kb.technique in (PAYLOAD.TECHNIQUE.TIME, PAYLOAD.TECHNIQUE.STACKED)
+    timeBasedCompare = getTechnique() in (PAYLOAD.TECHNIQUE.TIME, PAYLOAD.TECHNIQUE.STACKED)
 
     output = hashDBRetrieve(expression, checkConf=True)
 
@@ -328,22 +350,32 @@ def _goUnion(expression, unpack=True, dump=False):
 
     output = unionUse(expression, unpack=unpack, dump=dump)
 
-    if isinstance(output, basestring):
+    if isinstance(output, six.string_types):
         output = parseUnionPage(output)
 
     return output
 
+@lockedmethod
+@stackedmethod
 def getValue(expression, blind=True, union=True, error=True, time=True, fromUser=False, expected=None, batch=False, unpack=True, resumeValue=True, charsetType=None, firstChar=None, lastChar=None, dump=False, suppressOutput=None, expectingNone=False, safeCharEncode=True):
     """
     Called each time sqlmap inject a SQL query on the SQL injection
     affected parameter.
     """
 
-    if conf.hexConvert:
-        charsetType = CHARSET_TYPE.HEXADECIMAL
+    if conf.hexConvert and expected != EXPECTED.BOOL and Backend.getIdentifiedDbms():
+        if not hasattr(queries[Backend.getIdentifiedDbms()], "hex"):
+            warnMsg = "switch '--hex' is currently not supported on DBMS %s" % Backend.getIdentifiedDbms()
+            singleTimeWarnMessage(warnMsg)
+            conf.hexConvert = False
+        else:
+            charsetType = CHARSET_TYPE.HEXADECIMAL
 
     kb.safeCharEncode = safeCharEncode
     kb.resumeValues = resumeValue
+
+    for keyword in GET_VALUE_UPPERCASE_KEYWORDS:
+        expression = re.sub(r"(?i)(\A|\(|\)|\s)%s(\Z|\(|\)|\s)" % keyword, r"\g<1>%s\g<2>" % keyword, expression)
 
     if suppressOutput is not None:
         pushValue(getCurrentThreadData().disableStdOut)
@@ -356,7 +388,7 @@ def getValue(expression, blind=True, union=True, error=True, time=True, fromUser
         if expected == EXPECTED.BOOL:
             forgeCaseExpression = booleanExpression = expression
 
-            if expression.upper().startswith("SELECT "):
+            if expression.startswith("SELECT "):
                 booleanExpression = "(%s)=%s" % (booleanExpression, "'1'" if "'1'" in booleanExpression else "1")
             else:
                 forgeCaseExpression = agent.forgeCaseStatement(expression)
@@ -376,9 +408,15 @@ def getValue(expression, blind=True, union=True, error=True, time=True, fromUser
 
             if not conf.forceDns:
                 if union and isTechniqueAvailable(PAYLOAD.TECHNIQUE.UNION):
-                    kb.technique = PAYLOAD.TECHNIQUE.UNION
+                    setTechnique(PAYLOAD.TECHNIQUE.UNION)
                     kb.forcePartialUnion = kb.injection.data[PAYLOAD.TECHNIQUE.UNION].vector[8]
                     fallback = not expected and kb.injection.data[PAYLOAD.TECHNIQUE.UNION].where == PAYLOAD.WHERE.ORIGINAL and not kb.forcePartialUnion
+
+                    if expected == EXPECTED.BOOL:
+                        # Note: some DBMSes (e.g. Altibase) don't support implicit conversion of boolean check result during concatenation with prefix and suffix (e.g. 'qjjvq'||(1=1)||'qbbbq')
+
+                        if not any(_ in forgeCaseExpression for _ in ("SELECT", "CASE")):
+                            forgeCaseExpression = "(CASE WHEN (%s) THEN '1' ELSE '0' END)" % forgeCaseExpression
 
                     try:
                         value = _goUnion(forgeCaseExpression if expected == EXPECTED.BOOL else query, unpack, dump)
@@ -408,20 +446,20 @@ def getValue(expression, blind=True, union=True, error=True, time=True, fromUser
                             singleTimeWarnMessage(warnMsg)
 
                 if error and any(isTechniqueAvailable(_) for _ in (PAYLOAD.TECHNIQUE.ERROR, PAYLOAD.TECHNIQUE.QUERY)) and not found:
-                    kb.technique = PAYLOAD.TECHNIQUE.ERROR if isTechniqueAvailable(PAYLOAD.TECHNIQUE.ERROR) else PAYLOAD.TECHNIQUE.QUERY
+                    setTechnique(PAYLOAD.TECHNIQUE.ERROR if isTechniqueAvailable(PAYLOAD.TECHNIQUE.ERROR) else PAYLOAD.TECHNIQUE.QUERY)
                     value = errorUse(forgeCaseExpression if expected == EXPECTED.BOOL else query, dump)
                     count += 1
                     found = (value is not None) or (value is None and expectingNone) or count >= MAX_TECHNIQUES_PER_VALUE
 
                 if found and conf.dnsDomain:
-                    _ = "".join(filter(None, (key if isTechniqueAvailable(value) else None for key, value in {"E": PAYLOAD.TECHNIQUE.ERROR, "Q": PAYLOAD.TECHNIQUE.QUERY, "U": PAYLOAD.TECHNIQUE.UNION}.items())))
+                    _ = "".join(filterNone(key if isTechniqueAvailable(value) else None for key, value in {'E': PAYLOAD.TECHNIQUE.ERROR, 'Q': PAYLOAD.TECHNIQUE.QUERY, 'U': PAYLOAD.TECHNIQUE.UNION}.items()))
                     warnMsg = "option '--dns-domain' will be ignored "
                     warnMsg += "as faster techniques are usable "
                     warnMsg += "(%s) " % _
                     singleTimeWarnMessage(warnMsg)
 
             if blind and isTechniqueAvailable(PAYLOAD.TECHNIQUE.BOOLEAN) and not found:
-                kb.technique = PAYLOAD.TECHNIQUE.BOOLEAN
+                setTechnique(PAYLOAD.TECHNIQUE.BOOLEAN)
 
                 if expected == EXPECTED.BOOL:
                     value = _goBooleanProxy(booleanExpression)
@@ -432,12 +470,13 @@ def getValue(expression, blind=True, union=True, error=True, time=True, fromUser
                 found = (value is not None) or (value is None and expectingNone) or count >= MAX_TECHNIQUES_PER_VALUE
 
             if time and (isTechniqueAvailable(PAYLOAD.TECHNIQUE.TIME) or isTechniqueAvailable(PAYLOAD.TECHNIQUE.STACKED)) and not found:
-                kb.responseTimeMode = re.sub(r"(?i)[^a-z]", "", re.sub(r"'[^']+'", "", re.sub(r"(?i)(\w+)\(.+\)", r"\g<1>", expression))) if re.search(r"(?i)SELECT.+FROM", expression) else None
+                match = re.search(r"\bFROM\b ([^ ]+).+ORDER BY ([^ ]+)", expression)
+                kb.responseTimeMode = "%s|%s" % (match.group(1), match.group(2)) if match else None
 
                 if isTechniqueAvailable(PAYLOAD.TECHNIQUE.TIME):
-                    kb.technique = PAYLOAD.TECHNIQUE.TIME
+                    setTechnique(PAYLOAD.TECHNIQUE.TIME)
                 else:
-                    kb.technique = PAYLOAD.TECHNIQUE.STACKED
+                    setTechnique(PAYLOAD.TECHNIQUE.STACKED)
 
                 if expected == EXPECTED.BOOL:
                     value = _goBooleanProxy(booleanExpression)
@@ -460,22 +499,31 @@ def getValue(expression, blind=True, union=True, error=True, time=True, fromUser
 
     kb.safeCharEncode = False
 
-    if not any((kb.testMode, conf.dummy, conf.offline)) and value is None and Backend.getDbms() and conf.dbmsHandler and not conf.noCast and not conf.hexConvert:
+    if not any((kb.testMode, conf.dummy, conf.offline, conf.noCast, conf.hexConvert)) and value is None and Backend.getDbms() and conf.dbmsHandler and kb.fingerprinted:
         warnMsg = "in case of continuous data retrieval problems you are advised to try "
         warnMsg += "a switch '--no-cast' "
-        warnMsg += "or switch '--hex'" if Backend.getIdentifiedDbms() not in (DBMS.ACCESS, DBMS.FIREBIRD) else ""
+        warnMsg += "or switch '--hex'" if hasattr(queries[Backend.getIdentifiedDbms()], "hex") else ""
         singleTimeWarnMessage(warnMsg)
+
+    # Dirty patch (safe-encoded unicode characters)
+    if isinstance(value, six.text_type) and "\\x" in value:
+        try:
+            candidate = eval(repr(value).replace("\\\\x", "\\x").replace("u'", "'", 1)).decode(conf.encoding or UNICODE_ENCODING)
+            if "\\x" not in candidate:
+                value = candidate
+        except:
+            pass
 
     return extractExpectedValue(value, expected)
 
 def goStacked(expression, silent=False):
     if PAYLOAD.TECHNIQUE.STACKED in kb.injection.data:
-        kb.technique = PAYLOAD.TECHNIQUE.STACKED
+        setTechnique(PAYLOAD.TECHNIQUE.STACKED)
     else:
         for technique in getPublicTypeMembers(PAYLOAD.TECHNIQUE, True):
             _ = getTechniqueData(technique)
             if _ and "stacked" in _["title"].lower():
-                kb.technique = technique
+                setTechnique(technique)
                 break
 
     expression = cleanQuery(expression)
